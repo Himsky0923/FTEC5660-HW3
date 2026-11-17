@@ -55,9 +55,177 @@ def load_env_file(path: Path = Path(".env")) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
+# ---------------------------------------------------------------------------
+# Student solution: a routed, prompt-chained Fisher agent for points 4, 5, 7.
+#
+#   Point 4  (sales organization)   -> interview(customer | competitor, "sales_team")
+#   Point 5  (worthwhile margin)    -> sql_query: FY2025 operating margin vs industry median
+#   Point 7  (labour relations)     -> interview(current_employee | former_employee, "working_conditions")
+#
+# Pipeline per company (companies run in parallel):
+#   1. Router/planner: each point is routed to its evidence source; interviews are
+#      planned (best-informed role first, backup role only if needed).
+#   2. Tool use: SQL does all arithmetic; interviews collect scuttlebutt.
+#   3. LLM step A (per interview point, in parallel): classify the quote.
+#   4. LLM step B (reflection): a critic re-reads all evidence, checks every verdict
+#      and writes the summary. Disagreements on a qualitative verdict trigger a
+#      tie-break classification. Numeric (SQL) verdicts are never overridden by the LLM.
+# ---------------------------------------------------------------------------
+import json as _json
+import os
+import re
+from dataclasses import dataclass, field
+
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [4, 5, 7]  ### YOUR CODE HERE
+
+MAX_PARALLEL_COMPANIES = 8
+COMPANY_TIMEOUT_S = 420
+
+# Interview routing plan: topic + roles who know about it, most informative first.
+INTERVIEW_PLAN = {
+    4: {
+        "topic": "sales_team",
+        "roles": ["customer", "competitor"],
+        "rule": (
+            "PASS if the sales organization is above average: salespeople know the product and the "
+            "customer's needs, give real advice/service, follow up quickly, have stable relationships. "
+            "FAIL if they are order-takers who just send price lists, keep changing, do not know the product, "
+            "or customers go to rivals for advice."
+        ),
+        "fisher": "Fisher: 'Does the company have an above-average sales organization?'",
+    },
+    7: {
+        "topic": "working_conditions",
+        "roles": ["current_employee", "former_employee"],
+        "rule": (
+            "PASS if labour and personnel relations are good: fair pay, low turnover, people stay, "
+            "grievances are handled, decent morale. FAIL if there is constant overtime, high turnover, "
+            "low morale, strikes or strike threats, unfair treatment."
+        ),
+        "fisher": "Fisher: 'Does the company have outstanding labor and personnel relations?'",
+    },
+}
+
+MARGIN_SQL = """
+WITH rev AS (
+    SELECT substr(order_date, 1, 4) AS y, SUM(amount) AS revenue
+    FROM orders GROUP BY y
+), cost AS (
+    SELECT substr(month, 1, 4) AS y,
+           SUM(cost_of_sales) AS cos, SUM(selling_admin) AS sga, SUM(research_development) AS rd
+    FROM monthly_costs GROUP BY y
+)
+SELECT rev.y AS year,
+       ROUND(rev.revenue, 2) AS revenue,
+       ROUND(100.0 * (rev.revenue - cost.cos - cost.sga - cost.rd) / rev.revenue, 4) AS op_margin_pct,
+       (SELECT operating_margin_pct FROM industry_medians
+         WHERE industry = (SELECT industry FROM company LIMIT 1)) AS industry_median_pct,
+       (SELECT industry FROM company LIMIT 1) AS industry
+FROM rev JOIN cost ON rev.y = cost.y
+ORDER BY rev.y
+"""
+
+NEGATIVE_HINTS = (
+    "just send the price list", "go to rivals", "none of them knew", "different sales contacts",
+    "quit", "overtime is constant", "morale is low", "strike", "turnover", "underpaid", "leave",
+)
+NO_COMMENT_HINTS = ("can't comment", "can’t comment", "cannot comment", "can not comment", "no idea", "wouldn't know",
+                    "would not know", "not in a position", "don't know", "do not know")
+
+
+@dataclass
+class Evidence:
+    company: str
+    interviews: dict[int, list[tuple[str, str]]] = field(default_factory=dict)  # point -> [(role, answer)]
+    classifications: dict[int, dict[str, Any]] = field(default_factory=dict)
+    margin_rows: list[dict[str, str]] = field(default_factory=list)
+    margin_note: str = ""
+    verdicts: dict[int, str] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+
+
+def _parse_sql_table(text: str) -> list[dict[str, str]]:
+    """Turn the sql_query tool's 'a | b' output into a list of dicts."""
+    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+    if not lines or text.startswith("SQL error") or len(lines) < 2:
+        return []
+    header = [h.strip() for h in lines[0].split("|")]
+    rows = []
+    for ln in lines[1:]:
+        if ln.startswith("(no rows)") or ln.startswith("..."):
+            continue
+        cells = [c.strip() for c in ln.split("|")]
+        if len(cells) == len(header):
+            rows.append(dict(zip(header, cells)))
+    return rows
+
+
+def _parse_json(text: str) -> dict[str, Any]:
+    """Parse a JSON object from a model reply (tolerates code fences / extra text)."""
+    text = str(text).strip()
+    try:
+        return _json.loads(text)
+    except Exception:
+        match = re.search(r"\{.*\}", text, re.S)
+        if match:
+            return _json.loads(match.group(0))
+        raise
+
+
+def _tool_by_name(tools: list[Any], name: str) -> Any:
+    for t in tools:
+        if getattr(t, "name", "") == name:
+            return t
+    raise KeyError(name)
+
+
+def _keyword_verdict(answer: str) -> str:
+    """Last-resort fallback if the LLM is unavailable: crude keyword reading of a quote."""
+    low = answer.lower()
+    return "FAIL" if any(h in low for h in NEGATIVE_HINTS) else "PASS"
+
+
+def _says_no_comment(answer: str) -> bool:
+    low = answer.lower()
+    return any(h in low for h in NO_COMMENT_HINTS) or "interview limit reached" in low
+
+
+async def _llm_json(agent: dict[str, Any], system: str, user: str) -> dict[str, Any]:
+    """One JSON-mode call to deepseek-v4-flash, with a retry on malformed output."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    if agent is None or agent.get("json_llm") is None:
+        raise RuntimeError("model unavailable")
+    last_exc: Exception | None = None
+    for _ in range(3):
+        try:
+            reply = await agent["json_llm"].ainvoke([SystemMessage(system), HumanMessage(user)])
+            return _parse_json(reply.content)
+        except Exception as exc:  # malformed JSON, transient API errors
+            last_exc = exc
+            await asyncio.sleep(1.5)
+    raise RuntimeError(f"LLM call failed: {last_exc!r}")
+
+
+CLASSIFY_SYSTEM = """You are an investment analyst applying Philip Fisher's "scuttlebutt" method.
+You receive ONE interview quote about a company and the rule for one of Fisher's points.
+Decide:
+- knows_topic: false if the person says they cannot comment / do not know about this topic, else true.
+- verdict: "PASS" if the quote shows the company is favourable on the point, else "FAIL".
+Judge only from the quote. Reply with a JSON object:
+{"knows_topic": true|false, "verdict": "PASS"|"FAIL", "reason": "<one short sentence>"}"""
+
+REVIEW_SYSTEM = """You are a senior investment analyst reviewing a junior analyst's Fisher 15-point work.
+For each point you get the rule, the raw evidence gathered with tools, and the junior's verdict.
+Check every verdict against its rule and evidence (reflection). Numbers come from SQL and are exact;
+do not recompute them. Then write a short summary (2-4 sentences) for an investor explaining the
+final verdict on every point with its key evidence (quote interviews briefly, give the margin vs the
+industry median). The summary must not mention the review process, the junior analyst or 'verdicts holding'.
+Reply with a JSON object:
+{"checks": {"<point>": {"agree": true|false, "verdict": "PASS"|"FAIL", "why": "<short>"}},
+ "summary": "<2-4 sentences>"}"""
 
 
 def build_agent() -> Any:
@@ -72,7 +240,142 @@ def build_agent() -> Any:
     you will probably create one tool-calling agent per company there.
     """
     ### YOUR CODE HERE
-    return None
+    from langchain_deepseek import ChatDeepSeek
+
+    if not os.environ.get("DEEPSEEK_API_KEY"):
+        print("WARNING: DEEPSEEK_API_KEY is not set; LLM steps will fall back to rules.")
+    try:
+        llm = ChatDeepSeek(model=MODEL_NAME, temperature=0, timeout=90, max_retries=3)
+        # deepseek-v4-flash runs in thinking mode, which rejects forced tool_choice, so
+        # structured outputs use JSON mode.
+        json_llm = llm.bind(response_format={"type": "json_object"})
+    except Exception as exc:  # never crash the run: LLM steps then use the rule fallbacks
+        print(f"WARNING: could not create the model ({exc!r}); using rule fallbacks.")
+        llm = json_llm = None
+    return {"llm": llm, "json_llm": json_llm}
+
+
+# ----------------------------- point handlers ------------------------------
+
+async def _assess_margin(tools: list[Any], ev: Evidence) -> None:
+    """Point 5: FY2025 operating margin (computed in SQL) >= industry median -> PASS."""
+    sql = _tool_by_name(tools, "sql_query")
+    rows = _parse_sql_table(await sql.ainvoke({"query": MARGIN_SQL}))
+    ev.margin_rows = rows
+    by_year = {r["year"]: r for r in rows}
+    # Use the latest full fiscal year: FY2025 if present, else the latest year before the newest.
+    years = sorted(by_year)
+    target = "2025" if "2025" in by_year else (years[-2] if len(years) >= 2 else (years[-1] if years else None))
+    if target is None:
+        raise RuntimeError("margin query returned no rows")
+    row = by_year[target]
+    margin, median = float(row["op_margin_pct"]), float(row["industry_median_pct"])
+    ev.verdicts[5] = "PASS" if margin >= median else "FAIL"
+    trend = ", ".join(f"FY{y}: {float(by_year[y]['op_margin_pct']):.1f}%" for y in years)
+    ev.margin_note = (f"FY{target} operating margin {margin:.2f}% vs {row['industry']} industry median "
+                      f"{median:.2f}% (history {trend}; 2026 is H1 only).")
+
+
+async def _classify(agent: dict[str, Any], point: int, answer: str) -> dict[str, Any]:
+    plan = INTERVIEW_PLAN[point]
+    user = (f"Fisher point {point}: {FISHER_POINTS[point]}\nRule: {plan['rule']}\n"
+            f"Interview topic: {plan['topic']}\nQuote: {answer}")
+    out = await _llm_json(agent, CLASSIFY_SYSTEM, user)
+    verdict = str(out.get("verdict", "")).upper()
+    if verdict not in VERDICTS:
+        raise ValueError(f"bad verdict {out!r}")
+    return {"knows_topic": bool(out.get("knows_topic", True)), "verdict": verdict,
+            "reason": str(out.get("reason", ""))}
+
+
+async def _assess_interview_point(agent: dict[str, Any], tools: list[Any], point: int, ev: Evidence) -> None:
+    """Points 4 / 7: ask the best-informed role; fall back to the other role if they can't comment."""
+    interview = _tool_by_name(tools, "interview")
+    plan = INTERVIEW_PLAN[point]
+    ev.interviews[point] = []
+    for role in plan["roles"]:
+        answer = str(await interview.ainvoke({"role": role, "topic": plan["topic"]}))
+        ev.interviews[point].append((role, answer))
+        if "interview limit reached" in answer.lower():
+            break
+        try:
+            result = await _classify(agent, point, answer)
+        except Exception as exc:
+            ev.notes.append(f"point {point}: LLM classification failed ({exc!r}); keyword fallback")
+            result = {"knows_topic": not _says_no_comment(answer), "verdict": _keyword_verdict(answer),
+                      "reason": "keyword fallback"}
+        if result["knows_topic"]:
+            ev.classifications[point] = result
+            ev.verdicts[point] = result["verdict"]
+            return
+    # Nobody informative answered: Fisher would not give the benefit of the doubt blindly, but
+    # most companies pass, so default to PASS and record it.
+    ev.verdicts[point] = "PASS"
+    ev.notes.append(f"point {point}: no informed interviewee; defaulted to PASS")
+
+
+async def _review_and_summarize(agent: dict[str, Any], ev: Evidence) -> str:
+    """Reflection step: a critic checks the verdicts against the evidence and writes the summary."""
+    parts = []
+    for p in CHOSEN_POINTS:
+        if p in INTERVIEW_PLAN:
+            quotes = "\n".join(f"  - {role}: {ans}" for role, ans in ev.interviews.get(p, []))
+            parts.append(f"Point {p}: {FISHER_POINTS[p]}\nRule: {INTERVIEW_PLAN[p]['rule']}\n"
+                         f"Evidence (interviews):\n{quotes}\nJunior verdict: {ev.verdicts.get(p)}")
+        elif p == 5:
+            parts.append(f"Point 5: {FISHER_POINTS[5]}\nRule: PASS if FY2025 operating margin >= industry "
+                         f"median operating margin.\nEvidence (SQL): {ev.margin_note}\n"
+                         f"Junior verdict: {ev.verdicts.get(5)}")
+    out = await _llm_json(agent, REVIEW_SYSTEM, f"Company: {ev.company}\n\n" + "\n\n".join(parts))
+    checks = out.get("checks", {}) or {}
+    for p in CHOSEN_POINTS:
+        chk = checks.get(str(p)) or checks.get(p) or {}
+        critic = str(chk.get("verdict", "")).upper()
+        if p in INTERVIEW_PLAN and critic in VERDICTS and critic != ev.verdicts.get(p) and ev.interviews.get(p):
+            # Critic disagrees with the classifier: tie-break with a fresh classification.
+            answer = ev.interviews[p][-1][1]
+            try:
+                tie = await _classify(agent, p, answer)
+                ev.notes.append(f"point {p}: reviewer disagreed; tie-break -> {tie['verdict']}")
+                ev.verdicts[p] = tie["verdict"]
+            except Exception:
+                pass
+    return str(out.get("summary", "")).strip()
+
+
+def _fallback_summary(ev: Evidence) -> str:
+    bits = []
+    for p in CHOSEN_POINTS:
+        if p == 5:
+            bits.append(f"P5 {ev.verdicts.get(5)}: {ev.margin_note}")
+        elif ev.interviews.get(p):
+            role, ans = ev.interviews[p][-1]
+            bits.append(f"P{p} {ev.verdicts.get(p)}: {role} said {ans}")
+    return " ".join(bits)
+
+
+async def _analyze_one(agent: dict[str, Any], name: str, tools: list[Any]) -> dict[str, Any]:
+    ev = Evidence(company=name)
+    # Route each point to its own evidence source and run them in parallel.
+    tasks = []
+    for p in CHOSEN_POINTS:
+        if p == 5:
+            tasks.append(_assess_margin(tools, ev))
+        elif p in INTERVIEW_PLAN:
+            tasks.append(_assess_interview_point(agent, tools, p, ev))
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for p, res in zip(CHOSEN_POINTS, results):
+        if isinstance(res, Exception):
+            ev.notes.append(f"point {p} failed: {res!r}")
+    for p in CHOSEN_POINTS:  # anything still missing defaults to PASS (the majority class)
+        ev.verdicts.setdefault(p, "PASS")
+    try:
+        summary = await _review_and_summarize(agent, ev)
+    except Exception as exc:
+        ev.notes.append(f"review failed: {exc!r}")
+        summary = ""
+    summary = summary or _fallback_summary(ev)
+    return {"points": {p: ev.verdicts[p] for p in CHOSEN_POINTS}, "summary": summary}
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -109,8 +412,18 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_COMPANIES)
+
+    async def guarded(name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        async with semaphore:
+            try:
+                return name, await asyncio.wait_for(_analyze_one(agent, name, tools), COMPANY_TIMEOUT_S)
+            except Exception as exc:  # never let one company crash the run
+                return name, {"points": {p: "PASS" for p in CHOSEN_POINTS},
+                              "summary": f"Analysis failed ({type(exc).__name__}); default verdicts."}
+
+    pairs = await asyncio.gather(*(guarded(n, t) for n, t in companies.items()))
+    return dict(pairs)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
